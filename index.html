@@ -654,6 +654,42 @@ code{font-family:var(--mono);font-size:11px;background:rgba(0,120,255,.08);paddi
 const SUPA_URL = 'https://xqbirpiquznzhgfpdtxp.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhxYmlycGlxdXpuemhnZnBkdHhwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4MDEzMDMsImV4cCI6MjA4OTM3NzMwM30.ZiWKubeDvDjcLQ9MGKsMJW3llYT6y7FAROqSxnnI69c';
 let BACKEND_URL = 'https://axiom-backend-production-0618.up.railway.app';
+const EDGE_URL = 'https://xqbirpiquznzhgfpdtxp.supabase.co/functions/v1';
+
+// ── Supabase save helper ──────────────────────────────
+async function sbInsert(table, payload) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${table}`, {
+    method: 'POST',
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) { const e = await r.text(); throw new Error(e); }
+  return r;
+}
+
+async function sbPatch(table, filter, payload) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${table}?${filter}`, {
+    method: 'PATCH',
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) { const e = await r.text(); throw new Error(e); }
+  return r;
+}
+
+// ── Send email via Supabase Edge Function ────────────
+async function sendEmail(type, to, clientId, data) {
+  try {
+    const r = await fetch(`${EDGE_URL}/send-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, to, clientId, data })
+    });
+    const d = await r.json();
+    if (!r.ok) console.warn('Email warning:', d.error);
+    return d;
+  } catch(e) { console.warn('Email failed (non-critical):', e.message); return null; }
+}
 let ADMIN_KEY = '';
 let CURRENT_USER = null;
 let allCustomers = [];
@@ -857,38 +893,54 @@ async function loadCustomers() {
 }
 
 async function addCustomer() {
+  const emailVal = document.getElementById('cu-email').value.trim();
+  const clientId = document.getElementById('cu-id').value.trim();
+  const monthly = parseFloat(document.getElementById('cu-monthly').value) || 0;
+  const setup = parseFloat(document.getElementById('cu-setup').value) || 0;
+  const bizName = document.getElementById('cu-biz').value.trim();
+  const owner = document.getElementById('cu-owner').value.trim();
+  const plan = document.getElementById('cu-plan').value;
+
   const payload = {
-    client_id: document.getElementById('cu-id').value.trim(),
-    business_name: document.getElementById('cu-biz').value.trim(),
-    owner_name: document.getElementById('cu-owner').value.trim(),
-    login_email: document.getElementById('cu-email').value.trim(),
-    monthly_price: parseFloat(document.getElementById('cu-monthly').value) || 0,
-    setup_price: parseFloat(document.getElementById('cu-setup').value) || 0,
-    plan: document.getElementById('cu-plan').value,
+    client_id: clientId,
+    business_name: bizName,
+    owner_name: owner,
+    email: emailVal,
+    login_email: emailVal,
+    plan_price: monthly,
+    monthly_price: monthly,
+    setup_fee: setup,
+    setup_price: setup,
+    plan: plan,
     billing_status: 'trial'
   };
-  if (!payload.client_id || !payload.business_name) { alert('Client ID and Business Name required'); return; }
+  if (!clientId || !bizName) { alert('Client ID and Business Name required'); return; }
+  if (!emailVal) { alert('Login email required — needed to send welcome email'); return; }
   try {
-    await fetch(`${SUPA_URL}/rest/v1/customers`, {
-      method: 'POST',
-      headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify(payload)
-    });
+    await sbInsert('customers', payload);
     closeModal('customerModal');
     loadCustomers();
-    alert(`✅ ${payload.business_name} added!\n\nClient URL: axiomhq.vercel.app?client=${payload.client_id}`);
-  } catch(e) { alert('Error: ' + e.message); }
+
+    // Send welcome email with their URL and payment links
+    const emailData = {
+      businessName: bizName, ownerName: owner,
+      plan: plan, monthlyPrice: monthly, setupFee: setup,
+      loginEmail: emailVal,
+      setupLink: '', subLink: '' // links generated separately via Stripe
+    };
+    const emailSent = await sendEmail('welcome', emailVal, clientId, emailData);
+    const emailNote = emailSent?.success ? '\n\n📧 Welcome email sent!' : '\n\n⚠️ Email not sent — check Resend API key in Railway';
+    alert(`✅ ${bizName} added!\n\nClient URL: axiomhq.vercel.app?client=${clientId}${emailNote}`);
+  } catch(e) { alert('Error saving customer: ' + e.message); }
 }
 
 async function toggleCustomer(id, status) {
   const ns = status === 'active' ? 'suspended' : 'active';
   if (!confirm(`${ns === 'suspended' ? 'Suspend' : 'Activate'} account for ${id}?`)) return;
-  await fetch(`${SUPA_URL}/rest/v1/customers?client_id=eq.${id}`, {
-    method: 'PATCH',
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-    body: JSON.stringify({ billing_status: ns, updated_at: new Date().toISOString() })
-  });
-  loadCustomers();
+  try {
+    await sbPatch('customers', `client_id=eq.${id}`, { billing_status: ns, updated_at: new Date().toISOString() });
+    loadCustomers();
+  } catch(e) { alert('Error: ' + e.message); }
 }
 
 function copyURL(id) { navigator.clipboard.writeText(`axiomhq.vercel.app?client=${id}`); alert('Copied: axiomhq.vercel.app?client=' + id); }
@@ -928,22 +980,31 @@ async function addInvoice() {
     status: document.getElementById('inv-status').value
   };
   if (!payload.client_id) { alert('Client ID required'); return; }
-  await fetch(`${SUPA_URL}/rest/v1/invoices`, {
-    method: 'POST',
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-    body: JSON.stringify(payload)
-  });
-  closeModal('invoiceModal'); loadInvoices();
+  try {
+    await sbInsert('invoices', payload);
+    closeModal('invoiceModal');
+    loadInvoices();
+    // Email the client their invoice if they have an email
+    const cust = allCustomers.find(c => c.client_id === payload.client_id);
+    if (cust?.login_email || cust?.email) {
+      const to = cust.login_email || cust.email;
+      await sendEmail('invoice', to, payload.client_id, {
+        businessName: cust.business_name, invoiceNumber: payload.invoice_number,
+        amount: payload.amount, dueDate: payload.due_date
+      });
+      alert('✅ Invoice saved and emailed to ' + to);
+    } else {
+      alert('✅ Invoice saved. (No email on file for this client)');
+    }
+  } catch(e) { alert('Error saving invoice: ' + e.message); }
 }
 
 async function markPaid(id, current) {
   if (current === 'paid') { alert('Already marked as paid'); return; }
-  await fetch(`${SUPA_URL}/rest/v1/invoices?id=eq.${id}`, {
-    method: 'PATCH',
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-    body: JSON.stringify({ status: 'paid', updated_at: new Date().toISOString() })
-  });
-  loadInvoices();
+  try {
+    await sbPatch('invoices', `id=eq.${id}`, { status: 'paid', updated_at: new Date().toISOString() });
+    loadInvoices();
+  } catch(e) { alert('Error: ' + e.message); }
 }
 
 // ── BILLING ────────────────────────────────────────
@@ -998,7 +1059,7 @@ async function loadBugs() {
       <td><span class="sev-${b.severity}" style="font-weight:700;font-size:11px">${(b.severity||'medium').toUpperCase()}</span></td>
       <td><span class="badge badge-${b.status==='resolved'?'green':b.status==='in_progress'?'blue':b.status==='closed'?'gray':'red'}">${b.status}</span></td>
       <td style="font-size:11px;color:var(--t3)">${new Date(b.created_at).toLocaleDateString()}</td>
-      <td><button class="btn btn-ghost btn-xs" onclick="openBug('${b.id}','${b.title?.replace(/'/g,"\\'")}','${b.description?.replace(/'/g,"\\'")}','${b.status}','${b.severity}','${b.admin_notes||''}')">View</button></td>
+      <td><button class="btn btn-ghost btn-xs" onclick="openBug('${b.id}','${b.title?.replace(/'/g,"\\'")}','${b.description?.replace(/'/g,"\\'")}','${b.status}','${b.severity}','${b.admin_notes||''}','${b.client_id||''}')">View</button></td>
     </tr>`).join('');
   } catch(e) {}
 }
@@ -1012,8 +1073,12 @@ async function loadBugBadge() {
   } catch(e) {}
 }
 
-function openBug(id, title, desc, status, severity, notes) {
+let currentBugTitle = '';
+let currentBugClientId = '';
+function openBug(id, title, desc, status, severity, notes, clientId) {
   currentBugId = id;
+  currentBugTitle = title;
+  currentBugClientId = clientId || '';
   document.getElementById('bugDetail').innerHTML = `
     <div style="margin-bottom:16px;"><strong style="font-size:16px">${title}</strong></div>
     <div style="font-size:13px;color:var(--t2);line-height:1.7;margin-bottom:12px;">${desc}</div>
@@ -1030,12 +1095,25 @@ function openBug(id, title, desc, status, severity, notes) {
 async function updateBug() {
   const notes = document.getElementById('bugNotes').value;
   const status = document.getElementById('bugStatus').value;
-  await fetch(`${SUPA_URL}/rest/v1/bug_reports?id=eq.${currentBugId}`, {
-    method: 'PATCH',
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-    body: JSON.stringify({ admin_notes: notes, status, updated_at: new Date().toISOString(), ...(status==='resolved'?{resolved_at:new Date().toISOString()}:{}) })
-  });
-  closeModal('bugModal'); loadBugs(); loadBugBadge();
+  try {
+    await sbPatch('bug_reports', `id=eq.${currentBugId}`,
+      { admin_notes: notes, status, updated_at: new Date().toISOString(), ...(status==='resolved'?{resolved_at:new Date().toISOString()}:{}) }
+    );
+    // Email the customer if resolved or notes added
+    if (notes && currentBugClientId) {
+      const cust = allCustomers.find(c => c.client_id === currentBugClientId);
+      if (cust?.login_email || cust?.email) {
+        await sendEmail('bug_response', cust.login_email || cust.email, currentBugClientId, {
+          businessName: cust.business_name, bugTitle: currentBugTitle,
+          adminResponse: notes, status
+        });
+      }
+    }
+    closeModal('bugModal');
+    loadBugs();
+    loadBugBadge();
+    alert('✅ Bug report updated' + (notes ? ' and client notified by email' : ''));
+  } catch(e) { alert('Error: ' + e.message); }
 }
 
 // ── PARTNERS ───────────────────────────────────────
@@ -1079,12 +1157,12 @@ async function addPartner() {
     invited_at: new Date().toISOString()
   };
   if (!payload.name || !payload.login_pin) { alert('Name and PIN required'); return; }
-  await fetch(`${SUPA_URL}/rest/v1/team_members`, {
-    method: 'POST',
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-    body: JSON.stringify(payload)
-  });
-  closeModal('partnerModal'); loadPartners();
+  try {
+    await sbInsert('team_members', payload);
+    closeModal('partnerModal');
+    loadPartners();
+    alert(`✅ ${payload.name} added as ${payload.role}!\nThey can log in at axiom-adminzwm.vercel.app with their PIN.`);
+  } catch(e) { alert('Error saving partner: ' + e.message); }
 }
 
 // ── COMPETITOR INTEL ───────────────────────────────
@@ -1120,12 +1198,11 @@ async function addCompetitor() {
     threat_level: document.getElementById('ci-threat').value
   };
   if (!payload.name) { alert('Company name required'); return; }
-  await fetch(`${SUPA_URL}/rest/v1/competitor_intel`, {
-    method: 'POST',
-    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-    body: JSON.stringify(payload)
-  });
-  closeModal('intelModal'); loadIntel();
+  try {
+    await sbInsert('competitor_intel', payload);
+    closeModal('intelModal');
+    loadIntel();
+  } catch(e) { alert('Error saving competitor: ' + e.message); }
 }
 
 // ── BROADCAST & ROLLOUT ────────────────────────────
